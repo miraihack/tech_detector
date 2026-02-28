@@ -202,7 +202,7 @@
   function createTechIcon(tech) {
     const icon = document.createElement('img');
     icon.className = 'tech-icon';
-    icon.src = `../icons/techs/${tech.icon || tech.name.toLowerCase().replace(/[^a-z0-9]/g, '') + '.svg'}`;
+    icon.src = `techs/${tech.icon || tech.name.toLowerCase().replace(/[^a-z0-9]/g, '') + '.svg'}`;
     icon.alt = tech.name;
     icon.onerror = function () {
       const placeholder = document.createElement('div');

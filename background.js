@@ -141,7 +141,7 @@
     try {
       await api.scripting.executeScript({
         target: { tabId },
-        files: ['lib/browser-polyfill.js', 'detect.js', 'content.js']
+        files: ['browser-polyfill.js', 'detect.js', 'content.js']
       });
       await api.scripting.executeScript({
         target: { tabId },
@@ -223,7 +223,7 @@
     const top = Math.round(currentWindow.top + (currentWindow.height - height) / 2);
     const params = new URLSearchParams({ tabId: tab.id, tabUrl: tab.url });
     api.windows.create({
-      url: `${api.runtime.getURL('popup/popup.html')}?${params}`,
+      url: `${api.runtime.getURL('popup.html')}?${params}`,
       type: 'popup',
       width,
       height,
