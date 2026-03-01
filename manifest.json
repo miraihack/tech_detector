@@ -16,10 +16,10 @@
   },
   "action": {
     "default_icon": {
-      "16": "icons/icon-16.png",
-      "32": "icons/icon-32.png",
-      "48": "icons/icon-48.png",
-      "128": "icons/icon-128.png"
+      "16": "icon-16.png",
+      "32": "icon-32.png",
+      "48": "icon-48.png",
+      "128": "icon-128.png"
     }
   },
   "options_ui": {
@@ -27,14 +27,14 @@
     "open_in_tab": false
   },
   "icons": {
-    "16": "icons/icon-16.png",
-    "32": "icons/icon-32.png",
-    "48": "icons/icon-48.png",
-    "128": "icons/icon-128.png"
+    "16": "icon-16.png",
+    "32": "icon-32.png",
+    "48": "icon-48.png",
+    "128": "icon-128.png"
   },
   "web_accessible_resources": [
     {
-      "resources": ["technologies.json", "content-main.js", "icons/techs/*"],
+      "resources": ["technologies.json", "content-main.js", "techs/*"],
       "matches": ["<all_urls>"]
     }
   ],
