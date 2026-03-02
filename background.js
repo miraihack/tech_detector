@@ -14,6 +14,36 @@
   // Pending detection promises: tabId -> { resolve, timer }
   const pendingDetections = new Map();
 
+  // TLS security info cache (Firefox only): tabId -> TLS negotiation details
+  const tabTlsInfo = {};
+
+  // Firefox: capture TLS negotiation details via getSecurityInfo()
+  // Chrome does not have this API, so the guard ensures no-op on Chrome.
+  if (typeof browser !== 'undefined' && browser.webRequest?.getSecurityInfo) {
+    browser.webRequest.onHeadersReceived.addListener(
+      async (details) => {
+        try {
+          const info = await browser.webRequest.getSecurityInfo(
+            details.requestId, {}
+          );
+          if (info && info.state === 'secure') {
+            tabTlsInfo[details.tabId] = {
+              keaGroupName: info.keaGroupName || null,
+              cipherSuite: info.cipherSuite || null,
+              protocolVersion: info.protocolVersion || null,
+              signatureSchemeName: info.signatureSchemeName || null,
+              usedEch: info.usedEch || false
+            };
+          }
+        } catch (e) {
+          // getSecurityInfo may fail if request already completed
+        }
+      },
+      { urls: ['<all_urls>'], types: ['main_frame'] },
+      ['blocking']
+    );
+  }
+
   // Load technologies.json
   let technologies = null;
   async function loadTechnologies() {
@@ -208,7 +238,13 @@
     if (message.type === 'GET_DETECTIONS') {
       const data = tabDetections[message.tabId] || { url: '', detections: [] };
       sendResponse(data);
-      return false;
+      return true;
+    }
+
+    // Get browser-native TLS info (Firefox only; returns null on Chrome)
+    if (message.type === 'GET_TLS_INFO') {
+      sendResponse(tabTlsInfo[message.tabId] || null);
+      return true;
     }
 
     return false;
@@ -235,6 +271,7 @@
   // Clean up when tabs are closed
   api.tabs.onRemoved.addListener((tabId) => {
     delete tabDetections[tabId];
+    delete tabTlsInfo[tabId];
     if (pendingDetections.has(tabId)) {
       clearTimeout(pendingDetections.get(tabId).timer);
       pendingDetections.delete(tabId);

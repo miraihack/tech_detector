@@ -112,30 +112,52 @@
 
     const domain = getRegisteredDomain(new URL(tabUrl).hostname);
 
+    // Wrap each item in an async IIFE to guard against synchronous throws
+    // (e.g. api.scripting undefined, AbortSignal.timeout missing)
     const [httpResult, headResp, sslData, hstsPreloadData] = await Promise.all([
       // HTTP protocol version from content script
-      api.scripting.executeScript({
-        target: { tabId },
-        func: () => {
-          const e = performance.getEntriesByType('navigation');
-          return e[0] ? e[0].nextHopProtocol : '';
+      (async () => {
+        try {
+          return await api.scripting.executeScript({
+            target: { tabId },
+            func: () => {
+              const e = performance.getEntriesByType('navigation');
+              return e[0] ? e[0].nextHopProtocol : '';
+            }
+          });
+        } catch {
+          return [{ result: '' }];
         }
-      }).catch(() => [{ result: '' }]),
+      })(),
 
       // HSTS + Expect-CT from HEAD response
       fetch(tabUrl, { method: 'HEAD' }).catch(() => null),
 
       // SSL Labs cached TLS data (4s timeout)
-      fetchWithTimeout(
-        `https://api.ssllabs.com/api/v3/analyze?host=${domain}&fromCache=on&all=done`,
-        4000
-      ).then(r => r.ok ? r.json() : null).catch(() => null),
+      (async () => {
+        try {
+          const r = await fetchWithTimeout(
+            `https://api.ssllabs.com/api/v3/analyze?host=${domain}&fromCache=on&all=done`,
+            4000
+          );
+          return r.ok ? r.json() : null;
+        } catch {
+          return null;
+        }
+      })(),
 
       // HSTS Preload list status (4s timeout)
-      fetchWithTimeout(
-        `https://hstspreload.org/api/v2/status?domain=${encodeURIComponent(domain)}`,
-        4000
-      ).then(r => r.ok ? r.json() : null).catch(() => null)
+      (async () => {
+        try {
+          const r = await fetchWithTimeout(
+            `https://hstspreload.org/api/v2/status?domain=${encodeURIComponent(domain)}`,
+            4000
+          );
+          return r.ok ? r.json() : null;
+        } catch {
+          return null;
+        }
+      })(),
     ]);
 
     const result = { https: true };
@@ -194,15 +216,19 @@
             if (details.ocspStapling !== undefined) {
               result.ocspStapling = details.ocspStapling;
             }
-            // PQC (Post-Quantum Cryptography) key exchange detection
+            // PQC via SSL Labs namedGroups (cannot detect PQC as of v2.4.1)
+            // SSL Labs API v3 returns namedGroups as { list: [...], preference: bool }
             if (details.namedGroups) {
-              // NIST PQC finalists / hybrids: ML-KEM (Kyber), NTRU, SABER, BIKE, HQC
-              const PQC_PATTERNS = ['MLKEM', 'KYBER', 'NTRU', 'SABER', 'BIKE', 'HQC'];
-              result.pqcKeyExchange = details.namedGroups
+              const ngList = Array.isArray(details.namedGroups)
+                ? details.namedGroups
+                : (details.namedGroups.list ?? []);
+              const PQC_PATTERNS = ['MLKEM', 'KYBER'];
+              result.pqcKeyExchange = ngList
                 .filter(g => g.name && PQC_PATTERNS.some(p => g.name.toUpperCase().includes(p)))
                 .map(g => g.name);
-              result.allNamedGroups = details.namedGroups
+              result.allNamedGroups = ngList
                 .map(g => g.name || null).filter(Boolean);
+              result.pqcSource = 'ssllabs';
             }
             // Vulnerability detection from SSL Labs data
             result.vulns = [];
@@ -245,6 +271,38 @@
 
   function fetchWithTimeout(url, ms) {
     return fetch(url, { signal: AbortSignal.timeout(ms) });
+  }
+
+  /**
+   * Merge browser-native TLS info (Firefox getSecurityInfo) into encryption result.
+   * Called from init() after checkEncryption() completes, to avoid poisoning Promise.all.
+   */
+  function mergeBrowserTlsInfo(result, tlsInfo) {
+    if (!result || !tlsInfo) return;
+    // TLS version (fallback if SSL Labs didn't provide)
+    if (!result.tlsVersions && tlsInfo.protocolVersion) {
+      const ver = tlsInfo.protocolVersion.replace(/^TLSv?/i, '');
+      if (ver) result.tlsVersions = [ver];
+    }
+    // Cipher suite (fallback if SSL Labs didn't provide)
+    if (!result.cipher && tlsInfo.cipherSuite) {
+      result.cipher = tlsInfo.cipherSuite;
+    }
+    // PQC key exchange detection (overrides SSL Labs if available)
+    if (tlsInfo.keaGroupName) {
+      const PQC_KEA_GROUPS = [
+        'mlkem768x25519', 'secp256r1mlkem768',
+        'secp384r1mlkem1024', 'xyber768d00'
+      ];
+      const kea = tlsInfo.keaGroupName;
+      result.pqcKeyExchange = PQC_KEA_GROUPS.includes(kea) ? [kea] : [];
+      result.negotiatedGroup = kea;
+      result.pqcSource = 'browser';
+    }
+    // ECH (Encrypted Client Hello) status
+    if (tlsInfo.usedEch) {
+      result.ech = true;
+    }
   }
 
   // ─── Shared UI helpers ───
@@ -539,11 +597,19 @@
     }
   }
 
+  // Firefox keaGroupName → IANA standard name mapping
+  const FIREFOX_TO_IANA = {
+    'mlkem768x25519': 'X25519MLKEM768',
+    'secp256r1mlkem768': 'SecP256r1MLKEM768',
+    'secp384r1mlkem1024': 'SecP384r1MLKEM1024',
+    'xyber768d00': 'X25519Kyber768Draft00 (旧)'
+  };
+
   function renderPqc(data) {
     const section = document.getElementById('pqc-section');
     const content = document.getElementById('pqc-content');
 
-    // Show section only if SSL Labs data was available (pqcKeyExchange is set)
+    // Show section only if PQC data is available
     if (!data || data.pqcKeyExchange === undefined) {
       section.hidden = true;
       return;
@@ -552,14 +618,32 @@
     section.hidden = false;
     content.innerHTML = '';
 
+    // Data source indicator
+    if (data.pqcSource === 'browser') {
+      content.appendChild(createInfoRow('neutral', '検出方法', 'ブラウザ検出（実際のネゴシエーション結果）'));
+    }
+
     // Key exchange
     if (data.pqcKeyExchange.length > 0) {
-      content.appendChild(createInfoRow('pass', '鍵交換 (KEX)', data.pqcKeyExchange.join(', ')));
+      // Detect hybrid (classical + PQC) vs pure PQC by group name
+      // Hybrid: contains a classical component (x25519, secp*, xyber)
+      const isHybridGroup = (g) => /x25519|secp\d|xyber/i.test(g);
+      const displayNames = data.pqcKeyExchange.map(g => {
+        const ianaName = FIREFOX_TO_IANA[g] || g;
+        return isHybridGroup(g) ? `ハイブリッド構成（${ianaName}）` : `Pure PQC（${ianaName}）`;
+      });
+      content.appendChild(createInfoRow('pass', '鍵交換 (KEX)', displayNames.join(', ')));
     } else {
-      const classical = data.allNamedGroups && data.allNamedGroups.length > 0
-        ? data.allNamedGroups.slice(0, 3).join(', ')
-        : '古典暗号のみ';
-      content.appendChild(createInfoRow('fail', '鍵交換 (KEX)', `未対応（${classical}）`));
+      // Show the negotiated classical group (Firefox) or server-advertised groups (SSL Labs)
+      let classicalDetail;
+      if (data.negotiatedGroup) {
+        classicalDetail = `現行暗号アルゴリズム（${data.negotiatedGroup}）`;
+      } else if (data.allNamedGroups && data.allNamedGroups.length > 0) {
+        classicalDetail = `現行暗号アルゴリズム（${data.allNamedGroups.slice(0, 3).join(', ')}）`;
+      } else {
+        classicalDetail = '現行暗号アルゴリズム';
+      }
+      content.appendChild(createInfoRow('fail', '鍵交換 (KEX)', classicalDetail));
     }
 
     // Certificate signature algorithm
@@ -567,7 +651,7 @@
       content.appendChild(createInfoRow(
         data.pqcCertSig ? 'pass' : 'neutral',
         '証明書署名',
-        data.pqcCertSig ? 'PQC署名アルゴリズム使用' : '古典アルゴリズム (RSA / ECDSA)'
+        data.pqcCertSig ? 'PQC署名アルゴリズム使用' : '現行暗号アルゴリズム (RSA / ECDSA)'
       ));
     }
 
@@ -578,7 +662,7 @@
     if (kexOk && certOk) {
       verdictStatus = 'pass'; verdict = '完全対応';
     } else if (kexOk) {
-      verdictStatus = 'pass'; verdict = 'ハイブリッド鍵交換対応';
+      verdictStatus = 'pass'; verdict = 'PQC対応';
     } else {
       verdictStatus = 'fail'; verdict = '未対応';
     }
@@ -1360,6 +1444,16 @@
       const detections = data.detections || [];
       if (detections.some(d => d.name === 'WordPress')) {
         checkWordPress(tabId).then(renderWordPress).catch(() => {});
+      }
+
+      // Merge browser-native TLS info (Firefox only; safe no-op on Chrome)
+      try {
+        const tlsInfo = await api.runtime.sendMessage({ type: 'GET_TLS_INFO', tabId });
+        if (encryption && tlsInfo) {
+          mergeBrowserTlsInfo(encryption, tlsInfo);
+        }
+      } catch {
+        // Chrome: null, Firefox error: ignored
       }
 
       renderEncryption(encryption);
